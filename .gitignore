@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Output directories
+sbpl_results/
+afterglow_sbpl_plots/
+afterglow_sbpl_plots_v2/
+afterglow_photometry/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Misc
+.env
+*.swp
