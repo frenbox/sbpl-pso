@@ -19,8 +19,8 @@ constrained, the PSO can still extrapolate t_b into the ~150 d range
 and give the physically correct curve shape.
 
 Usage:
-    python fit_at2017gfo_sbpl.py
-    python fit_at2017gfo_sbpl.py --dat /path/to/AT2017gfo.dat
+    python scripts/fit_at2017gfo_sbpl.py
+    python scripts/fit_at2017gfo_sbpl.py --dat /path/to/AT2017gfo.dat
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,6 +36,12 @@ import pandas as pd
 from astropy.time import Time
 
 import sbpl_pso
+
+# Default paths below are resolved against the repo root rather than the current
+# working directory, so this script works the same from anywhere:
+#     python scripts/fit_at2017gfo_sbpl.py ...
+#     cd scripts && python fit_at2017gfo_sbpl.py ...
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ZP           = 23.9
@@ -76,9 +83,10 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--dat",
-        default="../lc_fitting_comparison/AT2017gfo_GRB170817A_corrected.dat",
+        default=str(REPO_ROOT.parent / "lc_fitting_comparison"
+                                     / "AT2017gfo_GRB170817A_corrected.dat"),
     )
-    parser.add_argument("--output-dir", default="sbpl_results")
+    parser.add_argument("--output-dir", default=str(REPO_ROOT / "sbpl_results"))
     args = parser.parse_args()
 
     print(f"Reading {args.dat} ...")

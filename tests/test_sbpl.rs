@@ -4,7 +4,8 @@
 //!   cargo test --release --test test_sbpl -- --nocapture
 
 use std::collections::HashMap;
-use sbpl_pso::{BandData, fit_sbpl, sbpl_model, band_frequency_hz, PsoConfig};
+use std::io::Write;
+use sbpl_pso::{BandData, fit_sbpl, sbpl_model, band_frequency_hz, load_csv, PsoConfig};
 
 // ---------------------------------------------------------------------------
 // Synthetic SBPL source generator
@@ -118,10 +119,34 @@ fn sbpl_model_positive_after_t0() {
 
 #[test]
 fn band_frequencies_are_positive() {
-    for band in &["g", "r", "i", "ztfg", "ztfr"] {
+    for band in &["g", "r", "i", "z", "y", "ztfg", "ztfr", "lsstz", "lssty"] {
         let nu = band_frequency_hz(band).unwrap();
         assert!(nu > 0.0, "frequency for {band} should be positive");
     }
+}
+
+#[test]
+fn load_csv_parses_lsst_zy_filter_names() {
+    let path = std::env::temp_dir().join(format!(
+        "sbpl_pso_test_{}_{:?}.csv",
+        std::process::id(),
+        std::time::SystemTime::now()
+    ));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "mjd,mag,mag_err,filter").unwrap();
+        writeln!(f, "1.0,20.0,0.1,lsstz").unwrap();
+        writeln!(f, "2.0,20.5,0.1,lssty").unwrap();
+        writeln!(f, "3.0,21.0,0.1,lsstg").unwrap();
+    }
+
+    let obs = load_csv(path.to_str().unwrap()).expect("load_csv should succeed");
+    std::fs::remove_file(&path).ok();
+
+    let bands: Vec<&str> = obs.iter().map(|o| o.band.as_str()).collect();
+    assert!(bands.contains(&"z"), "expected a 'z' observation, got {bands:?}");
+    assert!(bands.contains(&"y"), "expected a 'y' observation, got {bands:?}");
+    assert!(bands.contains(&"g"), "expected a 'g' observation, got {bands:?}");
 }
 
 // ---------------------------------------------------------------------------

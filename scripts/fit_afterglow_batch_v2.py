@@ -22,10 +22,10 @@ For fits that still have χ²_red > CHI2_RETRY, a fallback run is attempted
 with unconstrained alphas (±15) and 2× more PSO particles.
 
 Usage:
-    python fit_afterglow_batch_v2.py
-    python fit_afterglow_batch_v2.py --input-dir afterglow_photometry \\
+    python scripts/fit_afterglow_batch_v2.py
+    python scripts/fit_afterglow_batch_v2.py --input-dir afterglow_photometry \\
                                      --output-dir afterglow_sbpl_plots_v2
-    python fit_afterglow_batch_v2.py --n-particles 60 --n-iters 400 --n-restarts 5
+    python scripts/fit_afterglow_batch_v2.py --n-particles 60 --n-iters 400 --n-restarts 5
 """
 
 from __future__ import annotations
@@ -42,6 +42,12 @@ import pandas as pd
 
 import sbpl_pso
 
+# Default paths below are resolved against the repo root rather than the current
+# working directory, so this script works the same from anywhere:
+#     python scripts/fit_afterglow_batch_v2.py ...
+#     cd scripts && python fit_afterglow_batch_v2.py ...
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MAG_ERR          = 0.10
 MAX_PTS_PER_BAND = 60
@@ -52,11 +58,22 @@ CHI2_RETRY       = 10.0   # retry with looser constraints if chi2 > this
 ALPHA_MAX        = 15.0   # extended from ±10 to catch steeper slopes
 ALPHA_MIN        = -15.0
 
-BAND_COLOR = {"g": "#2ca02c", "r": "#d62728"}
-BAND_LABEL = {"g": "g-PS1",   "r": "r-PS1"}
+BAND_COLOR = {"g": "#2ca02c", "r": "#d62728", "i": "#ff7f0e", "z": "#9467bd", "y": "#8c564b"}
+BAND_LABEL = {"g": "g-PS1",   "r": "r-PS1",   "i": "i-PS1",   "z": "z-PS1",   "y": "y-PS1"}
+
+# Preference order for picking a reference band (shape classification, etc.)
+BAND_PREFERENCE = ("g", "r", "i", "z", "y")
 
 
 # ── Light-curve shape classifier ──────────────────────────────────────────────
+
+def reference_mag_column(df_raw: pd.DataFrame) -> str | None:
+    """First available `{band}_ps1_mag` column, in BAND_PREFERENCE order."""
+    return next(
+        (f"{band}_ps1_mag" for band in BAND_PREFERENCE if f"{band}_ps1_mag" in df_raw.columns),
+        None,
+    )
+
 
 def classify_shape(df_raw: pd.DataFrame) -> tuple[str, float | None]:
     """
@@ -64,7 +81,11 @@ def classify_shape(df_raw: pd.DataFrame) -> tuple[str, float | None]:
       clear_peak / early_peak / late_peak / monotone_fade / monotone_rise / too_faint
     peak_t_days is the estimated break time in days (None if too faint).
     """
-    g = df_raw["g_ps1_mag"].values
+    ref_col = reference_mag_column(df_raw)
+    if ref_col is None:
+        return "too_faint", None
+
+    g = df_raw[ref_col].values
     t = df_raw["time_days"].values
     valid = g < MAG_VALID_MAX
     if valid.sum() < 4:
@@ -164,7 +185,8 @@ def thin(arr: np.ndarray, max_pts: int) -> np.ndarray:
 
 def make_fit_csv(df_raw: pd.DataFrame, max_pts: int, mag_err: float) -> tuple[str, list[str]]:
     rows = []
-    for band, col in [("g", "g_ps1_mag"), ("r", "r_ps1_mag")]:
+    for band in BAND_PREFERENCE:
+        col = f"{band}_ps1_mag"
         if col not in df_raw.columns:
             continue
         mag   = df_raw[col].values
@@ -228,8 +250,9 @@ def fit_and_plot(
     tmp_csv, bands = make_fit_csv(df_raw, max_pts, mag_err)
 
     # Determine time range for adaptive t_b bounds
+    ref_col = reference_mag_column(df_raw)
     t_vals = df_raw["time_days"].values
-    g_vals = df_raw["g_ps1_mag"].values
+    g_vals = df_raw[ref_col].values
     valid  = g_vals < MAG_VALID_MAX
     t_min  = t_vals[valid].min() if valid.any() else t_vals.min()
     t_max  = t_vals[valid].max() if valid.any() else t_vals.max()
@@ -351,8 +374,8 @@ def fit_and_plot(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input-dir",   default="afterglow_photometry")
-    parser.add_argument("--output-dir",  default="afterglow_sbpl_plots_v2")
+    parser.add_argument("--input-dir",   default=str(REPO_ROOT / "afterglow_photometry"))
+    parser.add_argument("--output-dir",  default=str(REPO_ROOT / "afterglow_sbpl_plots_v2"))
     parser.add_argument("--max-pts",     type=int,   default=MAX_PTS_PER_BAND)
     parser.add_argument("--mag-err",     type=float, default=MAG_ERR)
     parser.add_argument("--n-particles", type=int,   default=50)

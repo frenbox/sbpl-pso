@@ -6,6 +6,8 @@ sbpl_results/
 afterglow_sbpl_plots/
 afterglow_sbpl_plots_v2/
 afterglow_photometry/
+afterglow_sbpl_plots_parquet/
+afterglow_example_Jim/
 
 # Python
 __pycache__/

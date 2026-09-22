@@ -2,9 +2,9 @@
 Fit an SBPL model to a ZTF photometry CSV and plot the result.
 
 Usage:
-    python fit_sbpl.py <photometry.csv>
-    python fit_sbpl.py <photometry.csv> --output-dir results/
-    python fit_sbpl.py <photometry.csv> --flux   # plot in flux instead of mag
+    python scripts/fit_sbpl.py <photometry.csv>
+    python scripts/fit_sbpl.py <photometry.csv> --output-dir results/
+    python scripts/fit_sbpl.py <photometry.csv> --flux   # plot in flux instead of mag
 
 The CSV must have columns: jd (or mjd), magpsf (or mag), sigmapsf (or
 mag_err), and either fid (1=g, 2=r, 3=i) or a filter string column.
@@ -27,10 +27,16 @@ import pandas as pd
 
 import sbpl_pso
 
+# Default paths below are resolved against the repo root rather than the current
+# working directory, so this script works the same from anywhere:
+#     python scripts/fit_sbpl.py ...
+#     cd scripts && python fit_sbpl.py ...
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 ZP = 23.9  # AB zero-point used by sbpl_pso
 
-BAND_COLOR = {"g": "#2ca02c", "r": "#d62728", "i": "#ff7f0e"}
-BAND_LABEL = {"g": "g-band", "r": "r-band", "i": "i-band"}
+BAND_COLOR = {"g": "#2ca02c", "r": "#d62728", "i": "#ff7f0e", "z": "#9467bd", "y": "#8c564b"}
+BAND_LABEL = {"g": "g-band", "r": "r-band", "i": "i-band", "z": "z-band", "y": "y-band"}
 
 
 def flux_to_mag(flux: np.ndarray) -> np.ndarray:
@@ -137,8 +143,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("csv", help="ZTF photometry CSV to fit")
-    parser.add_argument("--output-dir", default="sbpl_results",
-                        help="Directory to save the plot (default: sbpl_results)")
+    parser.add_argument("--output-dir", default=str(REPO_ROOT / "sbpl_results"),
+                        help="Directory to save the plot (default: <repo>/sbpl_results)")
     parser.add_argument("--flux", action="store_true",
                         help="Plot in physical flux instead of magnitudes")
     args = parser.parse_args()

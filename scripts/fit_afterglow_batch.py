@@ -2,7 +2,7 @@
 Batch SBPL fit for all CSVs in afterglow_photometry/.
 
 For each sample_XXXX.csv:
-  - Reads time_days, g_ps1_mag, r_ps1_mag
+  - Reads time_days and any of g/r/i/z/y_ps1_mag columns present
   - Adds a small synthetic uncertainty (MAG_ERR = 0.1 mag)
   - Subsamples to at most MAX_PTS_PER_BAND points per band
   - Runs sbpl_pso.fit()
@@ -11,9 +11,9 @@ For each sample_XXXX.csv:
 At the end writes a summary CSV: afterglow_sbpl_plots/fit_summary.csv
 
 Usage:
-    python fit_afterglow_batch.py
-    python fit_afterglow_batch.py --input-dir afterglow_photometry --output-dir afterglow_sbpl_plots
-    python fit_afterglow_batch.py --max-pts 40 --n-particles 50 --n-iters 300
+    python scripts/fit_afterglow_batch.py
+    python scripts/fit_afterglow_batch.py --input-dir afterglow_photometry --output-dir afterglow_sbpl_plots
+    python scripts/fit_afterglow_batch.py --max-pts 40 --n-particles 50 --n-iters 300
 """
 
 from __future__ import annotations
@@ -30,14 +30,20 @@ import pandas as pd
 
 import sbpl_pso
 
+# Default paths below are resolved against the repo root rather than the current
+# working directory, so this script works the same from anywhere:
+#     python scripts/fit_afterglow_batch.py ...
+#     cd scripts && python fit_afterglow_batch.py ...
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MAG_ERR         = 0.10          # synthetic photometric uncertainty (mag)
 MAX_PTS_PER_BAND = 60           # subsample long light curves for speed
 MAG_VALID_MAX    = 40.0         # skip bands where all points are fainter than this
 ZP               = 23.9         # AB zero-point used by sbpl_pso
 
-BAND_COLOR = {"g": "#2ca02c", "r": "#d62728"}
-BAND_LABEL = {"g": "g-PS1",   "r": "r-PS1"}
+BAND_COLOR = {"g": "#2ca02c", "r": "#d62728", "i": "#ff7f0e", "z": "#9467bd", "y": "#8c564b"}
+BAND_LABEL = {"g": "g-PS1",   "r": "r-PS1",   "i": "i-PS1",   "z": "z-PS1",   "y": "y-PS1"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -65,7 +71,8 @@ def thin(arr: np.ndarray, max_pts: int) -> np.ndarray:
 def make_fit_csv(df_raw: pd.DataFrame, max_pts: int, mag_err: float) -> tuple[str, list[str]]:
     """Convert wide afterglow CSV to long sbpl_pso format; return (tmp_path, bands_used)."""
     rows = []
-    for band, col in [("g", "g_ps1_mag"), ("r", "r_ps1_mag")]:
+    for band in ("g", "r", "i", "z", "y"):
+        col = f"{band}_ps1_mag"
         if col not in df_raw.columns:
             continue
         mag = df_raw[col].values
@@ -192,8 +199,8 @@ def fit_and_plot(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input-dir",   default="afterglow_photometry")
-    parser.add_argument("--output-dir",  default="afterglow_sbpl_plots")
+    parser.add_argument("--input-dir",   default=str(REPO_ROOT / "afterglow_photometry"))
+    parser.add_argument("--output-dir",  default=str(REPO_ROOT / "afterglow_sbpl_plots"))
     parser.add_argument("--max-pts",     type=int,   default=MAX_PTS_PER_BAND,
                         help="Max data points per band (subsampled if longer)")
     parser.add_argument("--mag-err",     type=float, default=MAG_ERR,
