@@ -14,6 +14,7 @@
 //! followed by L-BFGS polishing from the best PSO solution.
 
 use std::collections::HashMap;
+use std::f64::consts::LN_10;
 
 use argmin::core::{CostFunction, Error as ArgminError, Executor, Gradient};
 use argmin::solver::linesearch::MoreThuenteLineSearch;
@@ -30,8 +31,9 @@ pub mod gpu;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod gpu_metal;
 
-/// Host-side batch PSO driver shared by the CUDA and Metal backends.
-#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
+/// Host-side batch PSO driver shared by the CUDA and Metal backends. Also
+/// built for unit tests, which drive it with a CPU stand-in for the kernel.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos"), test))]
 pub(crate) mod gpu_common;
 
 /// Number of fitted parameters: `[alpha1, alpha2, beta, logd, loga, tb, t0]`.
@@ -261,23 +263,39 @@ pub struct SbplObs {
 ///
 /// This is the exact function the PSO minimises, on the CPU and on the GPU
 /// (`cuda/sbpl.cu` and `metal/sbpl.metal` reimplement it device-side).
+///
+/// The model is [`sbpl_model`], with the same failure sentinels, evaluated in
+/// log space: the per-particle constants are computed once per call rather
+/// than once per point, `ln(nu)` once per observation, and the flux is a
+/// single `exp` of a sum of logs. That is four transcendentals per point
+/// instead of six `powf`, and it leaves behind the logs that the analytic
+/// gradient in [`Self::eval_with_grad`] needs. Values agree with
+/// [`sbpl_model`] to rounding.
 #[derive(Clone, Debug)]
 pub struct SbplCost {
     observations: Vec<SbplObs>,
+    /// `ln(nu_scaled)` per observation.
+    ln_nu: Vec<f64>,
+    /// Some observation has `nu_scaled <= 0`, where [`sbpl_model`] is NaN for
+    /// every parameter vector, so every evaluation is the failure sentinel.
+    bad_nu: bool,
 }
 
 impl SbplCost {
     /// Build the objective for a [`PreparedSource`].
     pub fn new(prep: &PreparedSource) -> Self {
+        let observations: Vec<SbplObs> = (0..prep.times.len())
+            .map(|i| SbplObs {
+                time: prep.times[i],
+                nu_scaled: prep.nu_scaled[i],
+                flux: prep.flux[i],
+                flux_err: prep.flux_err[i],
+            })
+            .collect();
         SbplCost {
-            observations: (0..prep.times.len())
-                .map(|i| SbplObs {
-                    time: prep.times[i],
-                    nu_scaled: prep.nu_scaled[i],
-                    flux: prep.flux[i],
-                    flux_err: prep.flux_err[i],
-                })
-                .collect(),
+            ln_nu: observations.iter().map(|o| o.nu_scaled.ln()).collect(),
+            bad_nu: observations.iter().any(|o| o.nu_scaled <= 0.0),
+            observations,
         }
     }
 
@@ -288,25 +306,81 @@ impl SbplCost {
 
     /// Evaluate reduced chi² for `p = [alpha1, alpha2, beta, logd, loga, tb, t0]`.
     pub fn eval(&self, p: &[f64]) -> f64 {
+        self.chi2::<false>(p).0
+    }
+
+    /// [`Self::eval`] together with its analytic gradient with respect to `p`,
+    /// in one pass over the data. The gradient is zero wherever the cost is
+    /// the `1e10` failure sentinel.
+    pub fn eval_with_grad(&self, p: &[f64]) -> (f64, [f64; N_PARAMS]) {
+        self.chi2::<true>(p)
+    }
+
+    fn chi2<const GRAD: bool>(&self, p: &[f64]) -> (f64, [f64; N_PARAMS]) {
+        const FAIL: (f64, [f64; N_PARAMS]) = (1e10, [0.0; N_PARAMS]);
         let (alpha1, alpha2, beta, logd, loga, tb, t0) =
             (p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
+        if self.observations.is_empty() || self.bad_nu || tb <= 0.0 {
+            return FAIL;
+        }
+
+        let d = 10f64.powf(logd);
+        let inv_d = 1.0 / d;
+        let k = (alpha2 - alpha1) * d;
+        let ln_amp = loga * LN_10;
 
         let mut chi2 = 0.0;
-        let mut n_valid = 0usize;
-        for obs in &self.observations {
-            let model = sbpl_model(obs.time, obs.nu_scaled, alpha1, alpha2, beta, logd, loga, tb, t0);
+        let mut grad = [0.0; N_PARAMS];
+        for (obs, &ln_nu) in self.observations.iter().zip(&self.ln_nu) {
+            let err_sq = obs.flux_err * obs.flux_err + 1e-30;
+            let tau = obs.time - t0;
+            if tau < 0.0 {
+                // The model is 0 before t0, independent of every parameter.
+                chi2 += obs.flux * obs.flux / err_sq;
+                continue;
+            }
+            let ratio = tau / tb;
+            if ratio == 0.0 || !ratio.is_finite() {
+                return FAIL;
+            }
+            let ln_ratio = ratio.ln();
+            let q = (ln_ratio * inv_d).exp(); // ratio^(1/D)
+            let inner = 0.5 * (1.0 + q);
+            if !inner.is_finite() || inner <= 0.0 {
+                return FAIL;
+            }
+            let ln_inner = inner.ln();
+            // ln F = ln(10^loga) + beta·ln(nu) + alpha1·ln(ratio) + k·ln(inner)
+            let model = (ln_amp + beta * ln_nu + alpha1 * ln_ratio + k * ln_inner).exp();
             if !model.is_finite() {
-                return 1e10;
+                return FAIL;
             }
             let residual = obs.flux - model;
-            let err_sq = obs.flux_err * obs.flux_err + 1e-30;
             chi2 += residual * residual / err_sq;
-            n_valid += 1;
+
+            if GRAD {
+                // d chi2 / d p = (d chi2 / d ln F) · (d ln F / d p), per point.
+                let w = -2.0 * residual * model / err_sq;
+                // s = q / (1 + q) = D · d ln(inner) / d ln(ratio)
+                let s = 0.5 * q / inner;
+                let dlnf_dln_ratio = alpha1 + (alpha2 - alpha1) * s;
+                grad[0] += w * (ln_ratio - d * ln_inner);
+                grad[1] += w * d * ln_inner;
+                grad[2] += w * ln_nu;
+                grad[3] += w * LN_10 * (alpha2 - alpha1) * (d * ln_inner - s * ln_ratio);
+                grad[4] += w * LN_10;
+                grad[5] -= w * dlnf_dln_ratio / tb;
+                grad[6] -= w * dlnf_dln_ratio / tau;
+            }
         }
-        if n_valid == 0 {
-            return 1e10;
+
+        let n = self.observations.len() as f64;
+        if GRAD {
+            for g in &mut grad {
+                *g /= n;
+            }
         }
-        chi2 / n_valid as f64
+        (chi2 / n, grad)
     }
 }
 
@@ -344,23 +418,22 @@ impl CostFunction for ScaledCost<'_> {
 impl Gradient for ScaledCost<'_> {
     type Param = Vec<f64>;
     type Gradient = Vec<f64>;
+    /// Analytic gradient, chained through the unit-cube map. `unscale` clamps
+    /// to the box, so the cost is flat (zero gradient) in any coordinate that
+    /// has left it.
     fn gradient(&self, xs: &Self::Param) -> Result<Self::Gradient, ArgminError> {
-        let n = xs.len();
-        let h = 1e-5;
-        let mut grad = vec![0.0; n];
-        for i in 0..n {
-            let mut xp = xs.clone();
-            let mut xm = xs.clone();
-            xp[i] = (xs[i] + h).min(1.0);
-            xm[i] = (xs[i] - h).max(0.0);
-            let step = xp[i] - xm[i];
-            if step > 0.0 {
-                grad[i] = (self.inner.eval(&self.unscale(&xp))
-                    - self.inner.eval(&self.unscale(&xm)))
-                    / step;
-            }
-        }
-        Ok(grad)
+        let (_, grad) = self.inner.eval_with_grad(&self.unscale(xs));
+        Ok(xs
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                if (0.0..=1.0).contains(&x) {
+                    grad[i] * self.scale[i]
+                } else {
+                    0.0
+                }
+            })
+            .collect())
     }
 }
 

@@ -361,9 +361,10 @@ impl GpuContext {
         self.stream
     }
 
-    /// Fit every source in the batch: `config.n_restarts` GPU PSO passes, each
-    /// polished with L-BFGS on the CPU, assembled into one [`SbplResult`] per
-    /// source (in [`GpuBatchData::names`] order).
+    /// Fit every source in the batch: the `config.n_restarts` PSO swarms of
+    /// every source run side by side on the GPU, then each restart is polished
+    /// with L-BFGS on the CPU and assembled into one [`SbplResult`] per source
+    /// (in [`GpuBatchData::names`] order).
     pub fn batch_fit(
         &self,
         data: &GpuBatchData,
@@ -371,8 +372,7 @@ impl GpuContext {
     ) -> Result<Vec<SbplResult>, String> {
         self.set_device()?;
         let preps: Vec<&PreparedSource> = data.preps.iter().collect();
-        let evaluator = CudaEvaluator::new(self, data, config.n_particles.max(1))?;
-        gpu_common::batch_fit(&evaluator, &preps, config)
+        gpu_common::batch_fit(|n| CudaEvaluator::new(self, data, n), &preps, config)
     }
 
     /// Single PSO pass over the batch, without the L-BFGS polish. Returns the
@@ -389,9 +389,8 @@ impl GpuContext {
     ) -> Result<Vec<(Vec<f64>, f64)>, String> {
         self.set_device()?;
         let preps: Vec<&PreparedSource> = data.preps.iter().collect();
-        let evaluator = CudaEvaluator::new(self, data, config.n_particles.max(1))?;
         let mut out = gpu_common::batch_pso(
-            &evaluator,
+            |n| CudaEvaluator::new(self, data, n),
             &preps,
             config.n_particles,
             config.n_iters,
@@ -415,6 +414,7 @@ struct CudaEvaluator<'a> {
     data: &'a GpuBatchData,
     d_positions: DevBuf,
     d_costs: DevBuf,
+    /// Particles per source as the kernel sees them: every restart's swarm.
     n_particles: usize,
     grid: c_int,
     block: c_int,
@@ -431,8 +431,18 @@ impl<'a> CudaEvaluator<'a> {
         n_particles: usize,
     ) -> Result<Self, String> {
         let total = data.n_sources * n_particles;
-        // One warp per particle (see cuda/sbpl.cu).
-        let threads = (total as c_int).saturating_mul(WARP_SIZE);
+        // One warp per particle (see cuda/sbpl.cu), and the kernel's thread
+        // index is a 32-bit int.
+        let threads = total
+            .checked_mul(WARP_SIZE as usize)
+            .filter(|&t| t <= c_int::MAX as usize)
+            .ok_or_else(|| {
+                format!(
+                    "{} sources x {} particles is too many for one kernel launch; \
+                     split the batch",
+                    data.n_sources, n_particles
+                )
+            })? as c_int;
         let grid = (threads + BLOCK - 1) / BLOCK;
         Ok(Self {
             ctx,
@@ -448,6 +458,16 @@ impl<'a> CudaEvaluator<'a> {
 
 impl BatchCostEvaluator for CudaEvaluator<'_> {
     fn eval_batch(&self, positions: &[f64], costs: &mut [f64]) -> Result<(), String> {
+        // The copies below trust these lengths, and the device buffers were
+        // sized for exactly this many particles.
+        let total = self.data.n_sources * self.n_particles;
+        if positions.len() != total * N_PARAMS || costs.len() != total {
+            return Err(format!(
+                "eval_batch: evaluator holds {total} particles, got {} positions and {} costs",
+                positions.len() / N_PARAMS,
+                costs.len()
+            ));
+        }
         let stream = self.ctx.stream();
         self.d_positions.upload_from(positions, stream)?;
         unsafe {

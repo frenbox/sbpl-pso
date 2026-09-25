@@ -167,14 +167,26 @@ cargo run --release --bin cpu-dispatch-bench \
 The GPU evaluates the cost function; the CPU runs everything else.
 
 ```
-per PSO iteration:
-  CPU   move every particle of every source      (cheap, O(particles x 7))
-  GPU   score every particle of every source     (one launch, the expensive part)
+per PSO iteration (every restart's swarm at once):
+  CPU   move every particle of every swarm       (cheap, O(particles x 7))
+  GPU   score every particle of every source     (one launch per iteration)
   CPU   update personal / global bests
-after each restart:
-  CPU   L-BFGS polish per source, in parallel (fp64)
+after the PSO:
+  CPU   L-BFGS polish of every (source, restart), one parallel pass (fp64)
   CPU   loga rescaling + restart-spread uncertainties
 ```
+
+The restarts run side by side rather than one after another: with the default
+3 restarts × 30 particles the kernel scores 90 particles per source, in 201
+launches per batch instead of 603. Each swarm keeps its own RNG stream and the
+kernel scores particles independently, so this gives exactly the results that
+sequential restarts would (the unit tests in `src/gpu_common.rs` check this).
+Polishing all restarts in one pass also stops a batch's longest light curve
+from stalling each restart in turn.
+
+The polish uses the analytic gradient of the reduced χ²
+(`SbplCost::eval_with_grad`), about one cost evaluation per gradient where
+central differences needed 14.
 
 `src/gpu_common.rs` holds that driver and is shared by both backends — only the
 cost evaluation differs, behind one trait. The final numbers therefore come out
@@ -220,6 +232,12 @@ n_restarts=3`, RTX 5080 vs 24-thread Ryzen CPU:
 
 Fit quality is equivalent — the GPU matches or beats the CPU's χ² on 333 of 483
 sources and the median is marginally better.
+
+These numbers predate the analytic-gradient polish and side-by-side restarts.
+In them the CPU polish accounted for about 19 s of the 20.1 s CUDA wall time;
+in a CPU-side replica of the pipeline the polish now takes about 1 s, and the
+CPU-only fit about 7.4 s. Re-run `gpu-batch-bench --cpu-compare` to refresh the
+table.
 
 The kernel is fp64 and therefore bound by fp64 throughput, which consumer
 GeForce cards run at 1/64 of fp32. A datacenter card (A100/H100, 1/2 rate)

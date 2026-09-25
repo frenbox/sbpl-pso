@@ -5,7 +5,10 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use sbpl_pso::{BandData, fit_sbpl, sbpl_model, band_frequency_hz, load_csv, PsoConfig};
+use sbpl_pso::{
+    BandData, fit_sbpl, sbpl_model, band_frequency_hz, load_csv, prepare_source, Preparation,
+    PreparedSource, PsoConfig, SbplCost, N_PARAMS,
+};
 
 // ---------------------------------------------------------------------------
 // Synthetic SBPL source generator
@@ -293,4 +296,112 @@ fn sbpl_result_serialises_roundtrips() {
         (None, None) => {}
         _ => panic!("alpha1 Some/None mismatch after roundtrip"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Objective and analytic gradient
+// ---------------------------------------------------------------------------
+
+const TRUE_PARAMS: [f64; N_PARAMS] = [1.5, -1.8, -0.7, -0.4, 12.0, 10.0, 5.0];
+
+fn prepared_source(seed: u64) -> PreparedSource {
+    let [a1, a2, b, ld, la, tb, t0] = TRUE_PARAMS;
+    let bands = generate_sbpl_source(30, seed, a1, a2, b, ld, la, tb, t0);
+    match prepare_source(&bands, &PsoConfig::default()) {
+        Preparation::Ready(p) => p,
+        other => panic!("synthetic source not fittable: {other:?}"),
+    }
+}
+
+/// Reduced chi² built directly from `sbpl_model`.
+fn reference_chi2(prep: &PreparedSource, p: &[f64]) -> f64 {
+    let mut chi2 = 0.0;
+    for i in 0..prep.times.len() {
+        let m = sbpl_model(
+            prep.times[i], prep.nu_scaled[i], p[0], p[1], p[2], p[3], p[4], p[5], p[6],
+        );
+        if !m.is_finite() {
+            return 1e10;
+        }
+        let r = prep.flux[i] - m;
+        chi2 += r * r / (prep.flux_err[i] * prep.flux_err[i] + 1e-30);
+    }
+    chi2 / prep.times.len() as f64
+}
+
+#[test]
+fn sbpl_cost_matches_sbpl_model() {
+    let prep = prepared_source(4242);
+    let cost = SbplCost::new(&prep);
+    let duration = prep.times.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - prep.t_ref;
+    let mut rng = 0x5eed_u64;
+    for i in 0..500 {
+        let mut p = [0.0; N_PARAMS];
+        for d in 0..N_PARAMS {
+            p[d] = prep.lower[d] + xorshift(&mut rng) * (prep.upper[d] - prep.lower[d]);
+        }
+        if i % 2 == 1 {
+            // Put t0 inside the data so some points sit before it.
+            p[6] = prep.t_ref + xorshift(&mut rng) * duration;
+        }
+        let (got, want) = (cost.eval(&p), reference_chi2(&prep, &p));
+        assert!(
+            got == want || ((got - want) / want).abs() < 1e-10,
+            "params {p:?}: eval {got:e} vs sbpl_model {want:e}"
+        );
+        assert_eq!(cost.eval_with_grad(&p).0, got);
+    }
+}
+
+#[test]
+fn sbpl_cost_gradient_matches_finite_differences() {
+    let prep = prepared_source(4242);
+    let cost = SbplCost::new(&prep);
+    let mut truth = TRUE_PARAMS;
+    truth[4] -= prep.max_flux.log10(); // the fit works in normalised flux
+
+    let mut points = Vec::new();
+    let mut rng = 0xfeed_u64;
+    for _ in 0..8 {
+        let mut p = truth;
+        for d in 0..6 {
+            p[d] += (xorshift(&mut rng) - 0.5) * 0.4 * p[d].abs().max(0.5);
+        }
+        p[6] -= 5.0 * xorshift(&mut rng);
+        points.push(p);
+    }
+    // t0 half-way between two observations: the first few points are pre-t0.
+    let mut inside = truth;
+    let mut times = prep.times.clone();
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times.dedup();
+    inside[6] = 0.5 * (times[3] + times[4]);
+    points.push(inside);
+
+    for p in points {
+        let (c, grad) = cost.eval_with_grad(&p);
+        assert!(c < 1e10, "test point {p:?} is invalid");
+        let scale = grad.iter().fold(0.0f64, |m, g| m.max(g.abs()));
+        for d in 0..N_PARAMS {
+            let h = 1e-6 * (prep.upper[d] - prep.lower[d]);
+            let (mut hi, mut lo) = (p, p);
+            hi[d] += h;
+            lo[d] -= h;
+            let fd = (cost.eval(&hi) - cost.eval(&lo)) / (2.0 * h);
+            assert!(
+                (fd - grad[d]).abs() <= 1e-5 * (grad[d].abs() + 1e-3 * scale),
+                "d{d} at {p:?}: analytic {:e} vs finite difference {fd:e}",
+                grad[d]
+            );
+        }
+    }
+}
+
+#[test]
+fn sbpl_cost_sentinel_has_zero_gradient() {
+    let prep = prepared_source(4242);
+    let cost = SbplCost::new(&prep);
+    let mut p = TRUE_PARAMS;
+    p[5] = -1.0; // tb <= 0 is invalid everywhere
+    assert_eq!(cost.eval_with_grad(&p), (1e10, [0.0; N_PARAMS]));
 }

@@ -240,17 +240,17 @@ impl GpuContext {
         0
     }
 
-    /// Fit every source in the batch: `config.n_restarts` GPU PSO passes, each
-    /// polished with L-BFGS on the CPU, assembled into one [`SbplResult`] per
-    /// source (in [`GpuBatchData::names`] order).
+    /// Fit every source in the batch: the `config.n_restarts` PSO swarms of
+    /// every source run side by side on the GPU, then each restart is polished
+    /// with L-BFGS on the CPU and assembled into one [`SbplResult`] per source
+    /// (in [`GpuBatchData::names`] order).
     pub fn batch_fit(
         &self,
         data: &GpuBatchData,
         config: &PsoConfig,
     ) -> Result<Vec<SbplResult>, String> {
         let preps: Vec<&PreparedSource> = data.preps.iter().collect();
-        let evaluator = MetalEvaluator::new(self, data, config.n_particles.max(1));
-        gpu_common::batch_fit(&evaluator, &preps, config)
+        gpu_common::batch_fit(|n| MetalEvaluator::new(self, data, n), &preps, config)
     }
 
     /// Single PSO pass over the batch, without the L-BFGS polish. Returns the
@@ -266,9 +266,8 @@ impl GpuContext {
         seed: u64,
     ) -> Result<Vec<(Vec<f64>, f64)>, String> {
         let preps: Vec<&PreparedSource> = data.preps.iter().collect();
-        let evaluator = MetalEvaluator::new(self, data, config.n_particles.max(1));
         let mut out = gpu_common::batch_pso(
-            &evaluator,
+            |n| MetalEvaluator::new(self, data, n),
             &preps,
             config.n_particles,
             config.n_iters,
@@ -296,19 +295,31 @@ struct MetalEvaluator<'a> {
     /// [`BatchCostEvaluator::eval_batch`] takes `&self`.
     scratch: std::cell::RefCell<(Vec<f32>, Vec<f32>)>,
     total_particles: usize,
+    /// Particles per source as the shader sees them: every restart's swarm.
     n_particles: usize,
     threadgroup_count: MTLSize,
     threads_per_group: MTLSize,
 }
 
 impl<'a> MetalEvaluator<'a> {
-    fn new(ctx: &'a GpuContext, data: &'a GpuBatchData, n_particles: usize) -> Self {
+    fn new(
+        ctx: &'a GpuContext,
+        data: &'a GpuBatchData,
+        n_particles: usize,
+    ) -> Result<Self, String> {
         let total_particles = data.n_sources * n_particles;
         // One SIMD-group (32 lanes) per particle, THREADGROUP threads per group.
+        // The shader's thread index is a 32-bit uint.
         let n_threads = total_particles as u64 * SIMD_SIZE;
+        if n_threads > u32::MAX as u64 {
+            return Err(format!(
+                "{} sources x {} particles is too many for one dispatch; split the batch",
+                data.n_sources, n_particles
+            ));
+        }
         let n_threadgroups = (n_threads + THREADGROUP - 1) / THREADGROUP;
 
-        Self {
+        Ok(Self {
             ctx,
             data,
             d_positions: alloc_shared(
@@ -324,12 +335,24 @@ impl<'a> MetalEvaluator<'a> {
             n_particles,
             threadgroup_count: MTLSize::new(n_threadgroups.max(1), 1, 1),
             threads_per_group: MTLSize::new(THREADGROUP, 1, 1),
-        }
+        })
     }
 }
 
 impl BatchCostEvaluator for MetalEvaluator<'_> {
     fn eval_batch(&self, positions: &[f64], costs: &mut [f64]) -> Result<(), String> {
+        // The staging arrays and shared buffers were sized for exactly this
+        // many particles; a mismatch would silently truncate below.
+        if positions.len() != self.total_particles * N_PARAMS
+            || costs.len() != self.total_particles
+        {
+            return Err(format!(
+                "eval_batch: evaluator holds {} particles, got {} positions and {} costs",
+                self.total_particles,
+                positions.len() / N_PARAMS,
+                costs.len()
+            ));
+        }
         let mut scratch = self.scratch.borrow_mut();
         let (pos_f32, costs_f32) = &mut *scratch;
 
